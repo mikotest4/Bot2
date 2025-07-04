@@ -9,6 +9,10 @@ import sys
 import signal
 import logging
 from pathlib import Path
+import warnings
+
+# Suppress some warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Set up logging
 logging.basicConfig(
@@ -17,14 +21,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables for clients
+# Global variables
 clients = []
 running = True
+shutdown_event = asyncio.Event()
 
 def signal_handler(signum, frame):
     global running
     logger.info(f"Received signal {signum}, shutting down...")
     running = False
+    shutdown_event.set()
 
 async def check_dependencies():
     """Check if all required dependencies are installed"""
@@ -51,7 +57,15 @@ async def check_dependencies():
     
     if missing_modules:
         logger.error(f"Missing required modules: {', '.join(missing_modules)}")
-        logger.error("Please install missing dependencies with: pip install -r requirements.txt")
+        logger.error("Please install missing dependencies with:")
+        logger.error("pip3 install yt-dlp")
+        for module in missing_modules:
+            if module == 'cv2':
+                logger.error("pip3 install opencv-python-headless")
+            elif module == 'PIL':
+                logger.error("pip3 install Pillow")
+            else:
+                logger.error(f"pip3 install {module}")
         return False
     
     return True
@@ -101,24 +115,47 @@ async def shutdown_clients():
     """Gracefully shutdown all clients"""
     logger.info("Shutting down clients...")
     
+    # Stop clients first
     for client in clients:
         try:
             if hasattr(client, 'stop'):
                 await client.stop()
+                logger.info("Client stopped successfully")
             elif hasattr(client, 'disconnect'):
                 await client.disconnect()
+                logger.info("Client disconnected successfully")
         except Exception as e:
             logger.error(f"Error stopping client: {e}")
     
-    # Cancel all remaining tasks
-    tasks = [task for task in asyncio.all_tasks() if not task.done()]
-    if tasks:
-        logger.info(f"Cancelling {len(tasks)} remaining tasks...")
-        for task in tasks:
-            task.cancel()
+    # Wait a bit for cleanup
+    await asyncio.sleep(1)
+    
+    # Get current event loop
+    try:
+        loop = asyncio.get_running_loop()
         
-        # Wait for tasks to complete cancellation
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel all tasks except the current one
+        tasks = [
+            task for task in asyncio.all_tasks(loop) 
+            if not task.done() and task != asyncio.current_task()
+        ]
+        
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} remaining tasks...")
+            for task in tasks:
+                task.cancel()
+            
+            # Wait for tasks to complete cancellation with timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Some tasks didn't complete cancellation in time")
+    
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 async def main():
     """Main function with proper error handling and cleanup"""
@@ -148,26 +185,42 @@ async def main():
         
         logger.info("🚀 Bot is running! Press Ctrl+C to stop.")
         
-        # Keep the bot running
+        # Keep the bot running with proper shutdown handling
         while running:
-            await asyncio.sleep(1)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                continue
             
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
+        running = False
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         return 1
     finally:
         # Cleanup
-        await shutdown_clients()
+        try:
+            await shutdown_clients()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
         logger.info("Shutdown complete")
     
     return 0
 
 if __name__ == "__main__":
     try:
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Run the main function
-        exit_code = asyncio.run(main())
+        exit_code = loop.run_until_complete(main())
+        
+        # Close the loop properly
+        loop.close()
+        
         sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
