@@ -177,16 +177,45 @@ async def prog(c, t, C, h, m, st):
         await C.edit_message_text(h, m, f"__**Pyro Handler...**__\n\n{bar}\n\n⚡**__Completed__**: {c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__Done__**: {p:.2f}%\n🚀 **__Speed__**: {speed:.2f} MB/s\n⏳ **__ETA__**: {eta}\n\n**__Powered by Team SPY__**")
         if p >= 100: P.pop(m, None)
 
+async def validate_chat_id(c, tcid):
+    """Validate and fix chat ID format"""
+    try:
+        # Convert chat ID to proper format
+        if isinstance(tcid, str):
+            if tcid.startswith('-100'):
+                tcid = int(tcid)
+            elif tcid.startswith('@'):
+                pass  # Username format is fine
+            else:
+                try:
+                    tcid = int(tcid)
+                except:
+                    return None
+        
+        # Try to get chat info to validate
+        chat_info = await c.get_chat(tcid)
+        return chat_info.id  # Return the actual chat ID
+        
+    except Exception as e:
+        logger.error(f"Cannot access target chat {tcid}: {e}")
+        return None
+
 async def send_direct(c, m, tcid, ft=None, rtmid=None):
     try:
+        # Validate chat ID first
+        validated_chat = await validate_chat_id(c, tcid)
+        if not validated_chat:
+            raise Exception(f"Cannot access target chat {tcid}. Bot may not have permission.")
+        
+        tcid = validated_chat
+        
+        # Send the message based on type
         if m.video:
             await c.send_video(tcid, m.video.file_id, caption=ft, duration=m.video.duration, width=m.video.width, height=m.video.height, reply_to_message_id=rtmid)
         elif m.video_note:
             await c.send_video_note(tcid, m.video_note.file_id, duration=m.video_note.duration, length=m.video_note.length, reply_to_message_id=rtmid)
         elif m.animation:
             await c.send_animation(tcid, m.animation.file_id, duration=m.animation.duration, width=m.animation.width, height=m.animation.height, caption=ft, reply_to_message_id=rtmid)
-        elif m.sticker:
-            await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
         elif m.sticker:
             await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
         elif m.document:
@@ -199,12 +228,22 @@ async def send_direct(c, m, tcid, ft=None, rtmid=None):
             await c.send_photo(tcid, m.photo.file_id, caption=ft, reply_to_message_id=rtmid)
         elif m.text:
             await c.send_message(tcid, ft if ft else m.text, reply_to_message_id=rtmid)
+            
     except Exception as e:
         logger.error(f"Error sending direct: {e}")
+        raise Exception(f"Failed to send message: {str(e)}")
 
 async def handle_file_download(c, m, tcid, uid, ft=None, rtmid=None):
     """Handle file download and upload with progress"""
     try:
+        # Validate target chat first
+        validated_chat = await validate_chat_id(c, tcid)
+        if not validated_chat:
+            # Fallback to current user's chat if target chat is invalid
+            return await send_direct(c, m, tcid, ft, rtmid)
+        
+        tcid = validated_chat
+        
         # Check if file should be downloaded and re-uploaded
         rename_tag = await get_user_data_key(uid, "rename_tag", None)
         
@@ -326,6 +365,7 @@ async def handle_file_download(c, m, tcid, uid, ft=None, rtmid=None):
             
     except Exception as e:
         logger.error(f"File handling error: {e}")
+        # Fallback to direct send
         await send_direct(c, m, tcid, ft, rtmid)
 
 @X.on_message(filters.command("batch") & filters.private & ~login_in_progress)
@@ -510,8 +550,17 @@ async def process_single_link(client, message, user_id, link):
         if not msg:
             return False
         
-        # Get target chat
-        target_chat = await get_user_data_key(user_id, "chat_id", message.chat.id)
+        # Get target chat with proper fallback
+        target_chat = await get_user_data_key(user_id, "chat_id", None)
+        if not target_chat:
+            target_chat = message.chat.id  # Default to current chat
+        
+        # Validate target chat and fallback if needed
+        validated_chat = await validate_chat_id(client, target_chat)
+        if not validated_chat:
+            target_chat = message.chat.id  # Fallback to current chat
+        else:
+            target_chat = validated_chat
         
         # Get custom caption
         custom_caption = await get_user_data_key(user_id, "caption", None)
