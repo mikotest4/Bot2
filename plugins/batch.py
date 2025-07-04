@@ -15,13 +15,16 @@ from plugins.start import subscribe as sub
 from utils.custom_filters import login_in_progress
 from utils.encrypt import dcs
 from typing import Dict, Any, Optional
+import logging
 
+logger = logging.getLogger(__name__)
 
 Y = None if not STRING else __import__('shared_client').userbot
 Z, P, UB, UC, emp = {}, {}, {}, {}, {}
 
 ACTIVE_USERS = {}
 ACTIVE_USERS_FILE = "active_users.json"
+ongoing_downloads = {}
 
 # fixed directory file_name problems 
 def sanitize(filename):
@@ -41,7 +44,7 @@ async def save_active_users_to_file():
         with open(ACTIVE_USERS_FILE, 'w') as f:
             json.dump(ACTIVE_USERS, f)
     except Exception as e:
-        print(f"Error saving active users: {e}")
+        logger.error(f"Error saving active users: {e}")
 
 async def add_active_batch(user_id: int, batch_info: Dict[str, Any]):
     ACTIVE_USERS[str(user_id)] = batch_info
@@ -82,7 +85,7 @@ async def upd_dlg(c):
         async for _ in c.get_dialogs(limit=100): pass
         return True
     except Exception as e:
-        print(f'Failed to update dialogs: {e}')
+        logger.error(f'Failed to update dialogs: {e}')
         return False
 
 async def get_msg(c, u, i, d, lt):
@@ -97,7 +100,7 @@ async def get_msg(c, u, i, d, lt):
                     xm = await u.get_messages((await u.get_chat(f"@{i}")).id, d)
                 return xm
             except Exception as e:
-                print(f'Error fetching public message: {e}')
+                logger.error(f'Error fetching public message: {e}')
                 return None
         else:
             if u:
@@ -119,11 +122,11 @@ async def get_msg(c, u, i, d, lt):
                             async for _ in u.get_dialogs(limit=200): pass
                             return await u.get_messages(chat_id, d)
                 except Exception as e:
-                    print(f'Private channel error: {e}')
+                    logger.error(f'Private channel error: {e}')
                     return None
             return None
     except Exception as e:
-        print(f'Error fetching message: {e}')
+        logger.error(f'Error fetching message: {e}')
         return None
 
 async def get_ubot(uid):
@@ -136,7 +139,7 @@ async def get_ubot(uid):
         UB[uid] = bot
         return bot
     except Exception as e:
-        print(f"Error starting bot for user {uid}: {e}")
+        logger.error(f"Error starting bot for user {uid}: {e}")
         return None
 
 async def get_uclient(uid):
@@ -155,7 +158,7 @@ async def get_uclient(uid):
             UC[uid] = gg
             return gg
         except Exception as e:
-            print(f'User client error: {e}')
+            logger.error(f'User client error: {e}')
             return ubot if ubot else Y
     return Y
 
@@ -179,328 +182,415 @@ async def send_direct(c, m, tcid, ft=None, rtmid=None):
         if m.video:
             await c.send_video(tcid, m.video.file_id, caption=ft, duration=m.video.duration, width=m.video.width, height=m.video.height, reply_to_message_id=rtmid)
         elif m.video_note:
-            await c.send_video_note(tcid, m.video_note.file_id, reply_to_message_id=rtmid)
-        elif m.voice:
-            await c.send_voice(tcid, m.voice.file_id, reply_to_message_id=rtmid)
+            await c.send_video_note(tcid, m.video_note.file_id, duration=m.video_note.duration, length=m.video_note.length, reply_to_message_id=rtmid)
+        elif m.animation:
+            await c.send_animation(tcid, m.animation.file_id, duration=m.animation.duration, width=m.animation.width, height=m.animation.height, caption=ft, reply_to_message_id=rtmid)
         elif m.sticker:
             await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+        elif m.sticker:
+            await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+        elif m.document:
+            await c.send_document(tcid, m.document.file_id, caption=ft, reply_to_message_id=rtmid)
         elif m.audio:
             await c.send_audio(tcid, m.audio.file_id, caption=ft, duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title, reply_to_message_id=rtmid)
+        elif m.voice:
+            await c.send_voice(tcid, m.voice.file_id, caption=ft, duration=m.voice.duration, reply_to_message_id=rtmid)
         elif m.photo:
-            photo_id = m.photo.file_id if hasattr(m.photo, 'file_id') else m.photo[-1].file_id
-            await c.send_photo(tcid, photo_id, caption=ft, reply_to_message_id=rtmid)
-        elif m.document:
-            await c.send_document(tcid, m.document.file_id, caption=ft, file_name=m.document.file_name, reply_to_message_id=rtmid)
-        else:
-            return False
-        return True
+            await c.send_photo(tcid, m.photo.file_id, caption=ft, reply_to_message_id=rtmid)
+        elif m.text:
+            await c.send_message(tcid, ft if ft else m.text, reply_to_message_id=rtmid)
     except Exception as e:
-        print(f'Direct send error: {e}')
+        logger.error(f"Error sending direct: {e}")
+
+async def handle_file_download(c, m, tcid, uid, ft=None, rtmid=None):
+    """Handle file download and upload with progress"""
+    try:
+        # Check if file should be downloaded and re-uploaded
+        rename_tag = await get_user_data_key(uid, "rename_tag", None)
+        
+        if rename_tag or ft:
+            # Download and re-upload with custom name/caption
+            status_msg = await c.send_message(tcid, "📥 **Downloading file...**", reply_to_message_id=rtmid)
+            
+            # Download file
+            start_time = time.time()
+            
+            # Get file info
+            if m.document:
+                file_name = m.document.file_name or "document"
+                file_size = m.document.file_size
+            elif m.video:
+                file_name = f"video_{int(time.time())}.mp4"
+                file_size = m.video.file_size
+            elif m.audio:
+                file_name = m.audio.file_name or f"audio_{int(time.time())}.mp3"
+                file_size = m.audio.file_size
+            elif m.photo:
+                file_name = f"photo_{int(time.time())}.jpg"
+                file_size = 0  # Photos don't have file_size
+            else:
+                file_name = f"file_{int(time.time())}"
+                file_size = 0
+            
+            # Apply rename tag
+            if rename_tag:
+                file_extension = os.path.splitext(file_name)[1]
+                file_name = f"{rename_tag}{file_extension}"
+            
+            # Sanitize filename
+            file_name = sanitize(file_name)
+            
+            # Download file with progress
+            try:
+                downloaded_file = await c.download_media(
+                    m,
+                    file_name=file_name,
+                    progress=prog,
+                    progress_args=(c, tcid, status_msg.id, start_time)
+                )
+                
+                if downloaded_file:
+                    await status_msg.edit("📤 **Uploading file...**")
+                    
+                    # Upload file
+                    if m.video:
+                        # Get video metadata
+                        duration, width, height = await get_video_metadata(downloaded_file)
+                        thumb_path = await screenshot(downloaded_file, duration, uid)
+                        
+                        await c.send_video(
+                            tcid, 
+                            downloaded_file, 
+                            caption=ft,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            thumb=thumb_path,
+                            reply_to_message_id=rtmid,
+                            progress=prog,
+                            progress_args=(c, tcid, status_msg.id, time.time())
+                        )
+                        
+                        # Clean up
+                        if thumb_path and os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+                            
+                    elif m.document:
+                        thumb_path = thumbnail(uid)
+                        await c.send_document(
+                            tcid, 
+                            downloaded_file, 
+                            caption=ft,
+                            thumb=thumb_path,
+                            reply_to_message_id=rtmid,
+                            progress=prog,
+                            progress_args=(c, tcid, status_msg.id, time.time())
+                        )
+                        
+                    elif m.audio:
+                        thumb_path = thumbnail(uid)
+                        await c.send_audio(
+                            tcid, 
+                            downloaded_file, 
+                            caption=ft,
+                            thumb=thumb_path,
+                            duration=m.audio.duration,
+                            performer=m.audio.performer,
+                            title=m.audio.title,
+                            reply_to_message_id=rtmid,
+                            progress=prog,
+                            progress_args=(c, tcid, status_msg.id, time.time())
+                        )
+                        
+                    elif m.photo:
+                        await c.send_photo(
+                            tcid, 
+                            downloaded_file, 
+                            caption=ft,
+                            reply_to_message_id=rtmid
+                        )
+                    
+                    # Clean up downloaded file
+                    if os.path.exists(downloaded_file):
+                        os.remove(downloaded_file)
+                    
+                    await status_msg.delete()
+                
+            except Exception as e:
+                logger.error(f"Download/upload error: {e}")
+                await status_msg.edit(f"❌ **Error:** {str(e)}")
+                
+        else:
+            # Direct send without download
+            await send_direct(c, m, tcid, ft, rtmid)
+            
+    except Exception as e:
+        logger.error(f"File handling error: {e}")
+        await send_direct(c, m, tcid, ft, rtmid)
+
+@X.on_message(filters.command("batch") & filters.private & ~login_in_progress)
+async def batch_handler(client, message):
+    user_id = message.from_user.id
+    
+    # Check subscription
+    subscription_status = await sub(client, message)
+    if subscription_status == 1:
+        return
+    
+    # Check if user already has an active batch
+    if is_user_active(user_id):
+        await message.reply("⏳ **You have an active task. Use /stop to cancel it.**")
+        return
+    
+    # Check if user is premium or within limits
+    is_premium = await is_premium_user(user_id)
+    limit = PREMIUM_LIMIT if is_premium else FREEMIUM_LIMIT
+    
+    if not is_premium and FREEMIUM_LIMIT == 0:
+        await message.reply("❌ **Batch extraction is only available for premium users.**\n\nUse /plan to see premium plans.")
+        return
+    
+    # Ask for links
+    ask_msg = await message.reply(
+        f"📋 **Send me the links to extract (one per line)**\n\n"
+        f"{'🔸 **Premium User**' if is_premium else '🔸 **Free User**'}\n"
+        f"📊 **Batch Limit:** {limit} links\n\n"
+        f"**Example:**\n"
+        f"`https://t.me/channelname/123`\n"
+        f"`https://t.me/c/1234567890/123`\n\n"
+        f"Send /cancel to cancel this operation."
+    )
+    
+    # Add to active users
+    await add_active_batch(user_id, {
+        "status": "waiting_for_links",
+        "start_time": time.time(),
+        "limit": limit,
+        "current": 0,
+        "success": 0,
+        "cancel_requested": False,
+        "ask_msg_id": ask_msg.id
+    })
+
+@X.on_message(filters.text & filters.private & ~filters.command(['start', 'batch', 'cancel', 'stop', 'login', 'logout', 'help', 'settings', 'plan', 'status', 'dl', 'adl', 'setbot', 'rembot', 'session', 'terms', 'stats', 'transfer', 'add', 'rem', 'set']) & ~login_in_progress)
+async def handle_batch_links(client, message):
+    user_id = message.from_user.id
+    
+    # Check if user has active batch waiting for links
+    if not is_user_active(user_id):
+        return
+    
+    batch_info = get_batch_info(user_id)
+    if not batch_info or batch_info.get("status") != "waiting_for_links":
+        return
+    
+    try:
+        # Parse links
+        text = message.text.strip()
+        links = [link.strip() for link in text.split('\n') if link.strip()]
+        
+        if not links:
+            await message.reply("❌ **No valid links found. Please send links one per line.**")
+            return
+        
+        # Check limit
+        limit = batch_info.get("limit", FREEMIUM_LIMIT)
+        if len(links) > limit:
+            await message.reply(f"❌ **Too many links! Maximum allowed: {limit}**\n\nSend fewer links or upgrade to premium.")
+            return
+        
+        # Validate links
+        valid_links = []
+        for link in links:
+            if "t.me" in link:
+                valid_links.append(link)
+        
+        if not valid_links:
+            await message.reply("❌ **No valid Telegram links found.**\n\nPlease send valid t.me links.")
+            return
+        
+        # Update batch info
+        batch_info["status"] = "processing"
+        batch_info["links"] = valid_links
+        batch_info["total"] = len(valid_links)
+        await add_active_batch(user_id, batch_info)
+        
+        # Start processing
+        status_msg = await message.reply(
+            f"🚀 **Starting batch extraction...**\n\n"
+            f"📊 **Total Links:** {len(valid_links)}\n"
+            f"⏳ **Status:** Processing...\n\n"
+            f"Use /stop to cancel."
+        )
+        
+        # Process links
+        await process_batch_links(client, message, user_id, valid_links, status_msg)
+        
+    except Exception as e:
+        logger.error(f"Batch processing error: {e}")
+        await message.reply(f"❌ **Error:** {str(e)}")
+        await remove_active_batch(user_id)
+
+async def process_batch_links(client, message, user_id, links, status_msg):
+    """Process batch links with cancellation support"""
+    try:
+        total = len(links)
+        success = 0
+        failed = 0
+        
+        for i, link in enumerate(links):
+            # Check for cancellation
+            if should_cancel(user_id) or not is_user_active(user_id):
+                await status_msg.edit(
+                    f"🛑 **Batch cancelled by user**\n\n"
+                    f"📊 **Progress:** {i}/{total}\n"
+                    f"✅ **Success:** {success}\n"
+                    f"❌ **Failed:** {failed}"
+                )
+                break
+            
+            try:
+                # Update progress
+                await update_batch_progress(user_id, i + 1, success)
+                await status_msg.edit(
+                    f"🔄 **Processing batch...**\n\n"
+                    f"📊 **Progress:** {i + 1}/{total}\n"
+                    f"✅ **Success:** {success}\n"
+                    f"❌ **Failed:** {failed}\n\n"
+                    f"🔗 **Current:** {link[:50]}...\n\n"
+                    f"Use /stop to cancel."
+                )
+                
+                # Process single link
+                result = await process_single_link(client, message, user_id, link)
+                if result:
+                    success += 1
+                else:
+                    failed += 1
+                
+                # Small delay between links
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error processing link {link}: {e}")
+                failed += 1
+                continue
+        
+        # Final status
+        if is_user_active(user_id) and not should_cancel(user_id):
+            await status_msg.edit(
+                f"✅ **Batch completed!**\n\n"
+                f"📊 **Total:** {total}\n"
+                f"✅ **Success:** {success}\n"
+                f"❌ **Failed:** {failed}\n\n"
+                f"**Powered by Team SPY**"
+            )
+        
+    except Exception as e:
+        logger.error(f"Batch processing error: {e}")
+        await status_msg.edit(f"❌ **Batch failed:** {str(e)}")
+    finally:
+        await remove_active_batch(user_id)
+
+async def process_single_link(client, message, user_id, link):
+    """Process a single link and return success status"""
+    try:
+        # Parse link
+        chat_id, msg_id, link_type = E(link)
+        if not chat_id or not msg_id:
+            return False
+        
+        # Get appropriate client
+        user_client = await get_uclient(user_id)
+        if not user_client:
+            return False
+        
+        # Get message
+        msg = await get_msg(client, user_client, chat_id, msg_id, link_type)
+        if not msg:
+            return False
+        
+        # Get target chat
+        target_chat = await get_user_data_key(user_id, "chat_id", message.chat.id)
+        
+        # Get custom caption
+        custom_caption = await get_user_data_key(user_id, "caption", None)
+        
+        # Process caption
+        if custom_caption:
+            final_caption = custom_caption
+        elif msg.caption:
+            final_caption = await process_text_with_rules(user_id, msg.caption)
+        else:
+            final_caption = None
+        
+        # Check if file needs special handling
+        if msg.document or msg.video or msg.audio:
+            await handle_file_download(client, msg, target_chat, user_id, final_caption)
+        else:
+            await send_direct(client, msg, target_chat, final_caption)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing single link {link}: {e}")
         return False
 
-async def process_msg(c, u, m, d, lt, uid, i):
-    try:
-        cfg_chat = await get_user_data_key(d, 'chat_id', None)
-        tcid = d
-        rtmid = None
-        if cfg_chat:
-            if '/' in cfg_chat:
-                parts = cfg_chat.split('/', 1)
-                tcid = int(parts[0])
-                rtmid = int(parts[1]) if len(parts) > 1 else None
-            else:
-                tcid = int(cfg_chat)
+@X.on_message(filters.command(['cancel', 'stop']) & filters.private)
+async def handle_batch_cancel(client, message):
+    user_id = message.from_user.id
+    
+    if is_user_active(user_id):
+        # Force stop the batch immediately
+        await remove_active_batch(user_id)
         
-        if m.media:
-            orig_text = m.caption.markdown if m.caption else ''
-            proc_text = await process_text_with_rules(d, orig_text)
-            user_cap = await get_user_data_key(d, 'caption', '')
-            ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
-            
-            if lt == 'public' and not emp.get(i, False):
-                await send_direct(c, m, tcid, ft, rtmid)
-                return 'Sent directly.'
-            
-            st = time.time()
-            p = await c.send_message(d, 'Downloading...')
-
-            c_name = f"{time.time()}"
-            if m.video:
-                file_name = m.video.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp4"
-                    c_name = sanitize(file_name)
-            elif m.audio:
-                file_name = m.audio.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp3"
-                    c_name = sanitize(file_name)
-            elif m.document:
-                file_name = m.document.file_name
-                if not file_name:
-                    file_name = f"{time.time()}"
-                    c_name = sanitize(file_name)
-            elif m.photo:
-                file_name = f"{time.time()}.jpg"
-                c_name = sanitize(file_name)
-    
-            f = await u.download_media(m, file_name=c_name, progress=prog, progress_args=(c, d, p.id, st))
-            
-            if not f:
-                await c.edit_message_text(d, p.id, 'Failed.')
-                return 'Failed.'
-            
-            await c.edit_message_text(d, p.id, 'Renaming...')
-            if (
-                (m.video and m.video.file_name) or
-                (m.audio and m.audio.file_name) or
-                (m.document and m.document.file_name)
-            ):
-                f = await rename_file(f, d, p)
-            
-            fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
-            th = thumbnail(d)
-            
-            if fsize > 2 and Y:
-                st = time.time()
-                await c.edit_message_text(d, p.id, 'File is larger than 2GB. Using alternative method...')
-                await upd_dlg(Y)
-                mtd = await get_video_metadata(f)
-                dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                th = await screenshot(f, dur, d)
-                
-                send_funcs = {'video': Y.send_video, 'video_note': Y.send_video_note, 
-                            'voice': Y.send_voice, 'audio': Y.send_audio, 
-                            'photo': Y.send_photo, 'document': Y.send_document}
-                
-                for mtype, func in send_funcs.items():
-                    if f.endswith('.mp4'): mtype = 'video'
-                    if getattr(m, mtype, None):
-                        sent = await func(LOG_GROUP, f, thumb=th if mtype == 'video' else None, 
-                                        duration=dur if mtype == 'video' else None,
-                                        height=h if mtype == 'video' else None,
-                                        width=w if mtype == 'video' else None,
-                                        caption=ft if m.caption and mtype not in ['video_note', 'voice'] else None, 
-                                        reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
-                        break
-                else:
-                    sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft if m.caption else None,
-                                                reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
-                
-                await c.copy_message(d, LOG_GROUP, sent.id)
-                os.remove(f)
-                await c.delete_messages(d, p.id)
-                
-                return 'Done (Large file).'
-            
-            await c.edit_message_text(d, p.id, 'Uploading...')
-            st = time.time()
-
-            try:
-                if m.video or os.path.splitext(f)[1].lower() == '.mp4':
-                    mtd = await get_video_metadata(f)
-                    dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                    th = await screenshot(f, dur, d)
-                    await c.send_video(tcid, video=f, caption=ft if m.caption else None, 
-                                    thumb=th, width=w, height=h, duration=dur, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.video_note:
-                    await c.send_video_note(tcid, video_note=f, progress=prog, 
-                                        progress_args=(c, d, p.id, st), reply_to_message_id=rtmid)
-                elif m.voice:
-                    await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.sticker:
-                    await c.send_sticker(tcid, m.sticker.file_id)
-                elif m.audio:
-                    await c.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                elif m.photo:
-                    await c.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
-                                    reply_to_message_id=rtmid)
-                else:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(c, d, p.id, st), 
-                                        reply_to_message_id=rtmid)
-            except Exception as e:
-                await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:30]}')
-                if os.path.exists(f): os.remove(f)
-                return 'Failed.'
-            
-            os.remove(f)
-            await c.delete_messages(d, p.id)
-            
-            return 'Done.'
-            
-        elif m.text:
-            await c.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
-            return 'Sent.'
-    except Exception as e:
-        return f'Error: {str(e)[:50]}'
-
-@X.on_message(filters.command(['batch', 'single']))
-async def process_cmd(c, m):
-    uid = m.from_user.id
-    cmd = m.command[0]
-    
-    if FREEMIUM_LIMIT == 0 and not await is_premium_user(uid):
-        await m.reply_text("This bot does not provide free servies, get subscription from OWNER")
-        return
-    
-    if await sub(c, m) == 1: return
-    pro = await m.reply_text('Doing some checks hold on...')
-    
-    if is_user_active(uid):
-        await pro.edit('You have an active task. Use /stop to cancel it.')
-        return
-    
-    ubot = await get_ubot(uid)
-    if not ubot:
-        await pro.edit('Add your bot with /setbot first')
-        return
-    
-    Z[uid] = {'step': 'start' if cmd == 'batch' else 'start_single'}
-    await pro.edit(f'Send {"start link..." if cmd == "batch" else "link you to process"}.')
-
-@X.on_message(filters.command(['cancel', 'stop']))
-async def cancel_cmd(c, m):
-    uid = m.from_user.id
-    if is_user_active(uid):
-        if await request_batch_cancel(uid):
-            await m.reply_text('Cancellation requested. The current batch will stop after the current download completes.')
-        else:
-            await m.reply_text('Failed to request cancellation. Please try again.')
+        # Clear any ongoing downloads
+        if user_id in ongoing_downloads:
+            ongoing_downloads.pop(user_id, None)
+        
+        await message.reply("✅ **Batch stopped successfully!**")
     else:
-        await m.reply_text('No active batch process found.')
+        await message.reply("❌ **No active batch found to stop.**")
 
-@X.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
-    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
-    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
-async def text_handler(c, m):
-    uid = m.from_user.id
-    if uid not in Z: return
-    s = Z[uid].get('step')
+@X.on_message(filters.command("single") & filters.private & ~login_in_progress)
+async def single_handler(client, message):
+    user_id = message.from_user.id
+    
+    # Check subscription
+    subscription_status = await sub(client, message)
+    if subscription_status == 1:
+        return
+    
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply(
+            "**Usage:** `/single <telegram_link>`\n\n"
+            "**Example:** `/single https://t.me/channelname/123`"
+        )
+        return
+    
+    link = args[1].strip()
+    
+    if "t.me" not in link:
+        await message.reply("❌ **Please provide a valid Telegram link.**")
+        return
+    
+    status_msg = await message.reply("🔄 **Processing link...**")
+    
+    try:
+        result = await process_single_link(client, message, user_id, link)
+        if result:
+            await status_msg.edit("✅ **Link processed successfully!**")
+        else:
+            await status_msg.edit("❌ **Failed to process link.**")
+    except Exception as e:
+        logger.error(f"Single link processing error: {e}")
+        await status_msg.edit(f"❌ **Error:** {str(e)}")
 
-    if s == 'start':
-        L = m.text
-        i, d, lt = E(L)
-        if not i or not d:
-            await m.reply_text('Invalid link format.')
-            Z.pop(uid, None)
-            return
-        Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
-        await m.reply_text('How many messages?')
+# Initialize active users on module load
+ACTIVE_USERS = load_active_users()
 
-    elif s == 'start_single':
-        L = m.text
-        i, d, lt = E(L)
-        if not i or not d:
-            await m.reply_text('Invalid link format.')
-            Z.pop(uid, None)
-            return
-
-        Z[uid].update({'step': 'process_single', 'cid': i, 'sid': d, 'lt': lt})
-        i, s, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['lt']
-        pt = await m.reply_text('Processing...')
-        
-        ubot = UB.get(uid)
-        if not ubot:
-            await pt.edit('Add bot with /setbot first')
-            Z.pop(uid, None)
-            return
-        
-        uc = await get_uclient(uid)
-        if not uc:
-            await pt.edit('Cannot proceed without user client.')
-            Z.pop(uid, None)
-            return
-            
-        if is_user_active(uid):
-            await pt.edit('Active task exists. Use /stop first.')
-            Z.pop(uid, None)
-            return
-
-        try:
-            msg = await get_msg(ubot, uc, i, s, lt)
-            if msg:
-                res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                await pt.edit(f'1/1: {res}')
-            else:
-                await pt.edit('Message not found')
-        except Exception as e:
-            await pt.edit(f'Error: {str(e)[:50]}')
-        finally:
-            Z.pop(uid, None)
-
-    elif s == 'count':
-        if not m.text.isdigit():
-            await m.reply_text('Enter valid number.')
-            return
-        
-        count = int(m.text)
-        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
-
-        if count > maxlimit:
-            await m.reply_text(f'Maximum limit is {maxlimit}.')
-            return
-
-        Z[uid].update({'step': 'process', 'did': str(m.chat.id), 'num': count})
-        i, s, n, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['num'], Z[uid]['lt']
-        success = 0
-
-        pt = await m.reply_text('Processing batch...')
-        uc = await get_uclient(uid)
-        ubot = UB.get(uid)
-        
-        if not uc or not ubot:
-            await pt.edit('Missing client setup')
-            Z.pop(uid, None)
-            return
-            
-        if is_user_active(uid):
-            await pt.edit('Active task exists')
-            Z.pop(uid, None)
-            return
-        
-        await add_active_batch(uid, {
-            "total": n,
-            "current": 0,
-            "success": 0,
-            "cancel_requested": False,
-            "progress_message_id": pt.id
-            })
-        
-        try:
-            for j in range(n):
-                
-                if should_cancel(uid):
-                    await pt.edit(f'Cancelled at {j}/{n}. Success: {success}')
-                    break
-                
-                await update_batch_progress(uid, j, success)
-                
-                mid = int(s) + j
-                
-                try:
-                    msg = await get_msg(ubot, uc, i, mid, lt)
-                    if msg:
-                        res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                        if 'Done' in res or 'Copied' in res or 'Sent' in res:
-                            success += 1
-                    else:
-                        pass
-                except Exception as e:
-                    try: await pt.edit(f'{j+1}/{n}: Error - {str(e)[:30]}')
-                    except: pass
-                
-                await asyncio.sleep(10)
-            
-            if j+1 == n:
-                await m.reply_text(f'Batch Completed ✅ Success: {success}/{n}')
-        
-        finally:
-            await remove_active_batch(uid)
-            Z.pop(uid, None)
+# Plugin runner function (if needed by main.py)
+async def run_batch_plugin():
+    """Plugin runner function"""
+    logger.info("Batch plugin loaded and ready")
